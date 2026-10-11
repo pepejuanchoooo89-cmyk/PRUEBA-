@@ -1,0 +1,537 @@
+-- Language: Lua | File: StealAnEgg_Suite.lua
+-- Runtime: Roblox Executor (Synapse X / KRNL / Delta / Fluxus)
+-- Rayfield UI — loads via HttpGet
+-- Signature-resilient: no static offsets, resolves paths at runtime
+
+-- ══════════════════════════════════════════
+--  BOOTSTRAP
+-- ══════════════════════════════════════════
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+-- ══════════════════════════════════════════
+--  SERVICES
+-- ══════════════════════════════════════════
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace        = game:GetService("Workspace")
+local TweenService     = game:GetService("TweenService")
+local PathfindingService = game:GetService("PathfindingService")
+
+local LP  = Players.LocalPlayer
+local Cam = Workspace.CurrentCamera
+
+-- ══════════════════════════════════════════
+--  GLOBAL CONFIG (survives re-inject)
+-- ══════════════════════════════════════════
+getgenv().SAE = getgenv().SAE or {
+    ESP = {
+        Enabled      = true,
+        Boxes        = true,
+        Skeleton     = true,
+        Names        = true,
+        Distance     = true,
+        HealthBar    = true,
+        Items        = true,
+        MaxDist      = 400,
+        Colors = {
+            Player   = Color3.fromRGB(255, 80,  80 ),
+            Egg      = Color3.fromRGB(255, 220, 50 ),
+            Key      = Color3.fromRGB(50,  200, 255),
+            PowerUp  = Color3.fromRGB(180, 50,  255),
+            Health   = Color3.fromRGB(80,  255, 80 ),
+        },
+        Thickness    = 1.5,
+    },
+    Aimbot = {
+        Enabled      = false,
+        Smoothness   = 0.20,   -- 0.0 = instant, 1.0 = very slow
+        FOV          = 150,
+        ShowFOV      = true,
+        Mode         = "Closest",  -- "Closest" | "LowestHP" | "Crosshair"
+        Prediction   = true,
+        PredictMs    = 80,         -- lead time in ms
+    },
+    Farm = {
+        AutoCollect  = false,
+        AntiAFK      = true,
+        Teleport     = false,
+        TpCooldown   = 2.5,        -- seconds between teleports
+    },
+    Speed = {
+        Enabled      = false,
+        Value        = 28,
+    },
+    NoClip = { Enabled = false },
+}
+local CFG = getgenv().SAE
+
+-- ══════════════════════════════════════════
+--  HELPERS
+-- ══════════════════════════════════════════
+local function getHRP(p)
+    local c = p and p.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum(p)
+    local c = p and p.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function w2s(pos)
+    local s, vis = Cam:WorldToViewportPoint(pos)
+    return Vector2.new(s.X, s.Y), vis, s.Z
+end
+
+local function screenCenter()
+    return Vector2.new(Cam.ViewportSize.X / 2, Cam.ViewportSize.Y / 2)
+end
+
+-- Runtime path resolver — finds egg/key/powerup folders without static names
+local ITEM_TAGS = { egg = "Egg", key = "Key", powerup = "PowerUp" }
+
+local function resolveItemFolders()
+    local found = {}
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        local n = obj.Name:lower()
+        for tag, label in pairs(ITEM_TAGS) do
+            if n:find(tag) and obj:IsA("Folder") or obj:IsA("Model") then
+                found[label] = found[label] or {}
+                table.insert(found[label], obj)
+            end
+        end
+    end
+    return found
+end
+
+-- ══════════════════════════════════════════
+--  DRAWING POOL
+-- ══════════════════════════════════════════
+local pool = {}
+
+local function mkText(sz, col)
+    local d = Drawing.new("Text")
+    d.Visible = false; d.Size = sz or 13
+    d.Font = Drawing.Fonts.UI; d.Outline = true
+    d.Center = true; d.Color = col or Color3.new(1,1,1)
+    return d
+end
+
+local function mkLine(col, thick)
+    local d = Drawing.new("Line")
+    d.Visible = false
+    d.Color = col or Color3.new(1,1,1)
+    d.Thickness = thick or CFG.ESP.Thickness
+    return d
+end
+
+local function mkQuad(col, thick)
+    local d = Drawing.new("Quad")
+    d.Visible = false; d.Filled = false
+    d.Color = col or Color3.new(1,1,1)
+    d.Thickness = thick or CFG.ESP.Thickness
+    return d
+end
+
+local function mkRect(col)
+    local d = Drawing.new("Square")
+    d.Visible = false; d.Filled = true
+    d.Color = col or Color3.fromRGB(80,255,80)
+    return d
+end
+
+local function ensurePlayer(p)
+    if not pool[p] then
+        local c = CFG.ESP.Colors.Player
+        pool[p] = {
+            name    = mkText(13, c),
+            dist    = mkText(11, Color3.fromRGB(210,210,210)),
+            box     = mkQuad(c, CFG.ESP.Thickness),
+            hpBg    = mkRect(Color3.fromRGB(60,60,60)),
+            hpFill  = mkRect(CFG.ESP.Colors.Health),
+            -- skeleton: 6 limb lines
+            limbs   = { mkLine(c), mkLine(c), mkLine(c), mkLine(c), mkLine(c), mkLine(c) },
+        }
+    end
+    return pool[p]
+end
+
+local itemPool = {}  -- [part] = { label }
+
+local function ensureItem(part, label, col)
+    if not itemPool[part] then
+        itemPool[part] = { lbl = mkText(12, col) }
+    end
+    return itemPool[part]
+end
+
+local function wipePlayer(p)
+    local e = pool[p]; if not e then return end
+    for k, v in pairs(e) do
+        if type(v) == "table" then for _, d in ipairs(v) do d:Remove() end
+        else v:Remove() end
+    end
+    pool[p] = nil
+end
+
+Players.PlayerRemoving:Connect(wipePlayer)
+
+-- ══════════════════════════════════════════
+--  SKELETON BONE PAIRS (R6 / R15 adaptive)
+-- ══════════════════════════════════════════
+local R6_BONES = {
+    {"Head","Torso"},{"Torso","Left Arm"},{"Torso","Right Arm"},
+    {"Torso","Left Leg"},{"Torso","Right Leg"},{"Head","HumanoidRootPart"},
+}
+local R15_BONES = {
+    {"Head","UpperTorso"},{"UpperTorso","LowerTorso"},
+    {"UpperTorso","LeftUpperArm"},{"UpperTorso","RightUpperArm"},
+    {"LowerTorso","LeftUpperLeg"},{"LowerTorso","RightUpperLeg"},
+}
+
+local function getBones(char)
+    if char:FindFirstChild("UpperTorso") then return R15_BONES else return R6_BONES end
+end
+
+local function drawSkeleton(char, limbs, vis)
+    local bones = getBones(char)
+    for i, pair in ipairs(bones) do
+        local l = limbs[i]
+        if not l then continue end
+        local a = char:FindFirstChild(pair[1])
+        local b = char:FindFirstChild(pair[2])
+        if a and b then
+            local sa, va = w2s(a.Position)
+            local sb, vb = w2s(b.Position)
+            l.From    = sa; l.To = sb
+            l.Visible = vis and va and vb and CFG.ESP.Skeleton
+        else
+            l.Visible = false
+        end
+    end
+end
+
+-- ══════════════════════════════════════════
+--  ESP RENDER LOOP
+-- ══════════════════════════════════════════
+RunService.RenderStepped:Connect(function()
+    local myHRP = getHRP(LP)
+    local vp    = Cam.ViewportSize
+
+    -- ── Player ESP ──
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LP then continue end
+        local hrp = getHRP(p)
+        local hum = getHum(p)
+        if not hrp then wipePlayer(p); continue end
+
+        local dist = myHRP and (myHRP.Position - hrp.Position).Magnitude or 0
+        local e    = ensurePlayer(p)
+
+        if not CFG.ESP.Enabled or dist > CFG.ESP.MaxDist then
+            for k, v in pairs(e) do
+                if type(v) == "table" then for _, d in ipairs(v) do d.Visible = false end
+                else v.Visible = false end
+            end
+            continue
+        end
+
+        local top, topVis = w2s(hrp.Position + Vector3.new(0, 3.5, 0))
+        local bot, botVis = w2s(hrp.Position + Vector3.new(0, -3,  0))
+        local onScreen    = topVis and botVis
+
+        -- Box
+        if CFG.ESP.Boxes and onScreen then
+            local h  = math.abs(top.Y - bot.Y)
+            local w  = h * 0.6
+            e.box.PointA = top + Vector2.new(-w/2, 0)
+            e.box.PointB = top + Vector2.new( w/2, 0)
+            e.box.PointC = bot + Vector2.new( w/2, 0)
+            e.box.PointD = bot + Vector2.new(-w/2, 0)
+            e.box.Color  = CFG.ESP.Colors.Player
+            e.box.Visible = true
+        else e.box.Visible = false end
+
+        -- Name
+        e.name.Text     = p.DisplayName
+        e.name.Position = top + Vector2.new(0, -16)
+        e.name.Visible  = onScreen and CFG.ESP.Names
+
+        -- Distance
+        e.dist.Text     = math.floor(dist) .. " st"
+        e.dist.Position = bot + Vector2.new(0, 4)
+        e.dist.Visible  = onScreen and CFG.ESP.Distance
+
+        -- Health Bar
+        if hum and CFG.ESP.HealthBar and onScreen then
+            local h   = math.abs(top.Y - bot.Y)
+            local w   = h * 0.6
+            local barX = (top.X - w/2) - 6
+            local pct  = hum.Health / hum.MaxHealth
+            e.hpBg.Size     = Vector2.new(4, h)
+            e.hpBg.Position = Vector2.new(barX, top.Y)
+            e.hpBg.Visible  = true
+            e.hpFill.Size     = Vector2.new(4, h * pct)
+            e.hpFill.Position = Vector2.new(barX, top.Y + h * (1 - pct))
+            e.hpFill.Color    = Color3.fromRGB(
+                math.floor(255 * (1 - pct)), math.floor(255 * pct), 50)
+            e.hpFill.Visible  = true
+        else
+            e.hpBg.Visible = false; e.hpFill.Visible = false
+        end
+
+        -- Skeleton
+        if CFG.ESP.Skeleton and onScreen then
+            drawSkeleton(p.Character, e.limbs, true)
+        else
+            for _, l in ipairs(e.limbs) do l.Visible = false end
+        end
+    end
+
+    -- ── Item ESP ──
+    if CFG.ESP.Items then
+        local folders = resolveItemFolders()
+        for label, col in pairs({
+            Egg = CFG.ESP.Colors.Egg,
+            Key = CFG.ESP.Colors.Key,
+            PowerUp = CFG.ESP.Colors.PowerUp,
+        }) do
+            local flist = folders[label] or {}
+            for _, folder in ipairs(flist) do
+                for _, item in ipairs(folder:GetChildren()) do
+                    local part = item:FindFirstChildWhichIsA("BasePart") or
+                                 (item:IsA("BasePart") and item)
+                    if not part then continue end
+                    local sp, vis = w2s(part.Position)
+                    local dist2   = myHRP and (myHRP.Position - part.Position).Magnitude or 0
+                    local e2      = ensureItem(part, label, col)
+                    e2.lbl.Text     = label .. " [" .. math.floor(dist2) .. "]"
+                    e2.lbl.Position = sp + Vector2.new(0, -10)
+                    e2.lbl.Color    = col
+                    e2.lbl.Visible  = vis and dist2 < CFG.ESP.MaxDist
+                end
+            end
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════
+--  FOV CIRCLE
+-- ══════════════════════════════════════════
+local fovCircle = Drawing.new("Circle")
+fovCircle.Thickness = 1
+fovCircle.Color     = Color3.fromRGB(255, 255, 255)
+fovCircle.Filled    = false
+fovCircle.NumSides  = 64
+
+RunService.RenderStepped:Connect(function()
+    fovCircle.Visible  = CFG.Aimbot.Enabled and CFG.Aimbot.ShowFOV
+    fovCircle.Radius   = CFG.Aimbot.FOV
+    fovCircle.Position = screenCenter()
+end)
+
+-- ══════════════════════════════════════════
+--  AIMBOT
+-- ══════════════════════════════════════════
+local function getBestTarget()
+    local myHRP  = getHRP(LP)
+    if not myHRP then return nil end
+    local center = screenCenter()
+
+    local best, bestScore = nil, math.huge
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LP then continue end
+        local hrp = getHRP(p)
+        local hum = getHum(p)
+        if not hrp or not hum or hum.Health <= 0 then continue end
+
+        local targetPos = hrp.Position + Vector3.new(0, 1.5, 0)
+
+        -- prediction: lead by velocity * PredictMs
+        if CFG.Aimbot.Prediction then
+            local vel = hrp.AssemblyLinearVelocity
+            targetPos = targetPos + vel * (CFG.Aimbot.PredictMs / 1000)
+        end
+
+        local sp, vis = w2s(targetPos)
+        if not vis then continue end
+
+        local dist3D  = (myHRP.Position - hrp.Position).Magnitude
+        local distFOV = (sp - center).Magnitude
+
+        if distFOV > CFG.Aimbot.FOV then continue end
+
+        local score
+        if     CFG.Aimbot.Mode == "Closest"   then score = dist3D
+        elseif CFG.Aimbot.Mode == "LowestHP"  then score = hum.Health
+        elseif CFG.Aimbot.Mode == "Crosshair" then score = distFOV
+        else   score = dist3D end
+
+        if score < bestScore then bestScore = score; best = { hrp = hrp, pos = targetPos } end
+    end
+    return best
+end
+
+RunService.RenderStepped:Connect(function()
+    if not CFG.Aimbot.Enabled then return end
+    local t = getBestTarget()
+    if not t then return end
+    local goal = CFrame.new(Cam.CFrame.Position, t.pos)
+    Cam.CFrame  = Cam.CFrame:Lerp(goal, CFG.Aimbot.Smoothness)
+end)
+
+-- ══════════════════════════════════════════
+--  SPEED
+-- ══════════════════════════════════════════
+RunService.Heartbeat:Connect(function()
+    if not CFG.Speed.Enabled then return end
+    local hum = getHum(LP)
+    if hum then hum.WalkSpeed = CFG.Speed.Value end
+end)
+
+-- ══════════════════════════════════════════
+--  NO-CLIP
+-- ══════════════════════════════════════════
+RunService.Stepped:Connect(function()
+    if not CFG.NoClip.Enabled then return end
+    local c = LP.Character; if not c then return end
+    for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") then p.CanCollide = false end
+    end
+end)
+
+-- ══════════════════════════════════════════
+--  AUTO-FARM (pathfinding → nearest egg)
+-- ══════════════════════════════════════════
+local lastTp = 0
+
+task.spawn(function()
+    while task.wait(0.15) do
+        if not CFG.Farm.AutoCollect then continue end
+        local myHRP = getHRP(LP); if not myHRP then continue end
+
+        local folders = resolveItemFolders()
+        local eggFolders = folders["Egg"] or {}
+
+        local closest, closestDist = nil, math.huge
+        for _, folder in ipairs(eggFolders) do
+            for _, item in ipairs(folder:GetChildren()) do
+                local part = item:FindFirstChildWhichIsA("BasePart") or
+                             (item:IsA("BasePart") and item)
+                if not part then continue end
+                local d = (myHRP.Position - part.Position).Magnitude
+                if d < closestDist then closestDist = d; closest = part end
+            end
+        end
+
+        if not closest then continue end
+
+        if CFG.Farm.Teleport then
+            local now = tick()
+            if now - lastTp >= CFG.Farm.TpCooldown then
+                myHRP.CFrame = CFrame.new(closest.Position + Vector3.new(0, 3, 0))
+                lastTp = now
+            end
+        else
+            -- pathfind walk
+            local path = PathfindingService:CreatePath({
+                AgentRadius       = 2,
+                AgentHeight       = 5,
+                AgentCanJump      = true,
+                AgentMaxSlope     = 45,
+            })
+            local ok = pcall(function() path:ComputeAsync(myHRP.Position, closest.Position) end)
+            if ok and path.Status == Enum.PathStatus.Success then
+                for _, wp in ipairs(path:GetWaypoints()) do
+                    if not CFG.Farm.AutoCollect then break end
+                    local hum = getHum(LP); if not hum then break end
+                    if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+                    hum:MoveTo(wp.Position)
+                    hum.MoveToFinished:Wait()
+                end
+            end
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════
+--  ANTI-AFK
+-- ══════════════════════════════════════════
+task.spawn(function()
+    while task.wait(math.random(45, 75)) do
+        if not CFG.Farm.AntiAFK then continue end
+        -- fire a random VirtualUser input
+        local vu = game:GetService("VirtualUser")
+        vu:Button1Down(Vector2.new(math.random(200,600), math.random(200,500)), CFrame.new())
+        task.wait(0.1)
+        vu:Button1Up(Vector2.new(math.random(200,600), math.random(200,500)), CFrame.new())
+    end
+end)
+
+-- ══════════════════════════════════════════
+--  RAYFIELD UI
+-- ══════════════════════════════════════════
+local Win = Rayfield:CreateWindow({
+    Name            = "Steal an Egg Suite",
+    LoadingTitle    = "SAE Suite",
+    LoadingSubtitle = "absolute olliE",
+    ConfigurationSaving = { Enabled = false },
+    KeySystem       = false,
+})
+
+-- ─── Visuals ────────────────────────────
+local tVis = Win:CreateTab("Visuals", "eye")
+
+tVis:CreateToggle({ Name = "ESP",        CurrentValue = CFG.ESP.Enabled,   Flag = "esp",    Callback = function(v) CFG.ESP.Enabled   = v end })
+tVis:CreateToggle({ Name = "Boxes",      CurrentValue = CFG.ESP.Boxes,     Flag = "boxes",  Callback = function(v) CFG.ESP.Boxes     = v end })
+tVis:CreateToggle({ Name = "Skeleton",   CurrentValue = CFG.ESP.Skeleton,  Flag = "skel",   Callback = function(v) CFG.ESP.Skeleton  = v end })
+tVis:CreateToggle({ Name = "Names",      CurrentValue = CFG.ESP.Names,     Flag = "names",  Callback = function(v) CFG.ESP.Names     = v end })
+tVis:CreateToggle({ Name = "Distance",   CurrentValue = CFG.ESP.Distance,  Flag = "dst",    Callback = function(v) CFG.ESP.Distance  = v end })
+tVis:CreateToggle({ Name = "Health Bar", CurrentValue = CFG.ESP.HealthBar, Flag = "hp",     Callback = function(v) CFG.ESP.HealthBar = v end })
+tVis:CreateToggle({ Name = "Item ESP",   CurrentValue = CFG.ESP.Items,     Flag = "items",  Callback = function(v) CFG.ESP.Items     = v end })
+tVis:CreateSlider({ Name = "Max Distance", Range = {50,800}, Increment = 25, CurrentValue = CFG.ESP.MaxDist, Flag = "maxd", Callback = function(v) CFG.ESP.MaxDist = v end })
+
+-- ─── Aimbot ─────────────────────────────
+local tAim = Win:CreateTab("Aimbot", "crosshair")
+
+tAim:CreateToggle({ Name = "Aimbot",    CurrentValue = CFG.Aimbot.Enabled,   Flag = "aim",    Callback = function(v) CFG.Aimbot.Enabled   = v end })
+tAim:CreateToggle({ Name = "Show FOV",  CurrentValue = CFG.Aimbot.ShowFOV,   Flag = "fovviz", Callback = function(v) CFG.Aimbot.ShowFOV   = v end })
+tAim:CreateToggle({ Name = "Prediction",CurrentValue = CFG.Aimbot.Prediction,Flag = "pred",   Callback = function(v) CFG.Aimbot.Prediction= v end })
+tAim:CreateSlider({ Name = "Smoothness (%)", Range = {1,100}, Increment = 1, CurrentValue = CFG.Aimbot.Smoothness * 100, Flag = "smooth",
+    Callback = function(v) CFG.Aimbot.Smoothness = v / 100 end })
+tAim:CreateSlider({ Name = "FOV Radius", Range = {20, 500}, Increment = 10, CurrentValue = CFG.Aimbot.FOV, Flag = "fovr",
+    Callback = function(v) CFG.Aimbot.FOV = v end })
+tAim:CreateSlider({ Name = "Predict Lead (ms)", Range = {10, 300}, Increment = 5, CurrentValue = CFG.Aimbot.PredictMs, Flag = "predms",
+    Callback = function(v) CFG.Aimbot.PredictMs = v end })
+tAim:CreateDropdown({ Name = "Target Mode", Options = {"Closest","LowestHP","Crosshair"}, CurrentOption = {CFG.Aimbot.Mode}, Flag = "tmode",
+    Callback = function(v) CFG.Aimbot.Mode = v[1] end })
+
+-- ─── Farm ───────────────────────────────
+local tFarm = Win:CreateTab("Farm", "coins")
+
+tFarm:CreateToggle({ Name = "Auto Collect",  CurrentValue = CFG.Farm.AutoCollect, Flag = "ac",    Callback = function(v) CFG.Farm.AutoCollect = v end })
+tFarm:CreateToggle({ Name = "Teleport Mode", CurrentValue = CFG.Farm.Teleport,    Flag = "tp",    Callback = function(v) CFG.Farm.Teleport    = v end })
+tFarm:CreateToggle({ Name = "Anti-AFK",      CurrentValue = CFG.Farm.AntiAFK,     Flag = "afk",   Callback = function(v) CFG.Farm.AntiAFK     = v end })
+tFarm:CreateSlider({ Name = "Teleport Cooldown (s)", Range = {0.5, 10}, Increment = 0.5, CurrentValue = CFG.Farm.TpCooldown, Flag = "tpcd",
+    Callback = function(v) CFG.Farm.TpCooldown = v end })
+
+-- ─── Player ─────────────────────────────
+local tPly = Win:CreateTab("Player", "person-standing")
+
+tPly:CreateToggle({ Name = "Speed Hack", CurrentValue = CFG.Speed.Enabled, Flag = "spd",    Callback = function(v) CFG.Speed.Enabled = v end })
+tPly:CreateSlider({ Name = "WalkSpeed",  Range = {16,100}, Increment = 2,  CurrentValue = CFG.Speed.Value, Flag = "spdv",
+    Callback = function(v) CFG.Speed.Value = v end })
+tPly:CreateToggle({ Name = "No-Clip",   CurrentValue = CFG.NoClip.Enabled, Flag = "noclip", Callback = function(v) CFG.NoClip.Enabled = v end })
+
+-- ─── Info ───────────────────────────────
+local tInfo = Win:CreateTab("Info", "info")
+tInfo:CreateParagraph({ Title = "Item ESP Note",
+    Content = "resolveItemFolders() scans Workspace at runtime — no static paths. If eggs don't highlight, open Explorer in your executor and find the folder name under Workspace, then add it to ITEM_TAGS." })
+tInfo:CreateParagraph({ Title = "Aimbot Note",
+    Content = "Camera-lerp aim — works on any game without mouse hooks. Smoothness 0.20 = natural follow. Raise toward 0.80 for harder snap." })
+tInfo:CreateParagraph({ Title = "Farm Modes",
+    Content = "Pathfind = walks to egg using navmesh. Teleport = instant blink with cooldown. Teleport is faster but more detectable server-side." })
+
+print("[SAE Suite] loaded — Insert to toggle UI")
